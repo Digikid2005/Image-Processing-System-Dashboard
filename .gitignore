@@ -1,0 +1,19 @@
+# Python Environment
+venv/
+__pycache__/
+.tmp_build/
+
+# AI Model Weights
+*.pt
+*.pth
+*.pb
+
+# Dynamic Media (Ignore all files except the .gitkeep placeholders)
+static/analyzed/*
+!static/analyzed/.gitkeep
+static/enhanced/*
+!static/enhanced/.gitkeep
+static/images/*
+!static/images/.gitkeep
+static/videos/*
+!static/videos/.gitkeep

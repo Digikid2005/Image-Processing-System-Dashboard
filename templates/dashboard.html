@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Athena Vision Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #121212; color: #ffffff; padding: 20px; }
+        .grid-container { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 20px;}
+        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; }
+        .video-box { width: 100%; height: 450px; background-color: #000; border-radius: 8px; object-fit: contain; }
+        .terminal { background-color: #000; color: #00ff00; font-family: 'Courier New', monospace; padding: 10px; height: 180px; overflow-y: auto; border-radius: 8px; margin-top: 15px; border: 1px solid #333;}
+        .ai-results-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .img-preview { width: 100%; height: 250px; background: #000; border-radius: 4px; border: 1px dashed #555; display: flex; align-items: center; justify-content: center; color: #777; object-fit: contain;}
+        button { padding: 10px 15px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; width: 100%; margin-bottom: 10px; font-weight: bold;}
+        button:hover { background: #0056b3; }
+        input[type="file"] { margin-bottom: 10px; color: #fff;}
+    </style>
+</head>
+<body>
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2>Athena Vision Command Center</h2>
+        <a href="/logout" style="color: #ff4d4d; text-decoration: none; font-weight: bold;">[ Logout ]</a>
+    </div>
+    
+    <div class="grid-container">
+        <div class="card">
+            <h3>Live Feed / Stream</h3>
+            <img src="{{ url_for('video_feed') }}" class="video-box" id="media-player">
+            <div class="terminal" id="web-terminal">Loading system logs...</div>
+        </div>
+
+        <div class="card">
+            <h3>Media Source</h3>
+            <form action="/upload" method="POST" enctype="multipart/form-data">
+                <input type="file" name="media_file" accept="video/*,image/*" required>
+                <button type="submit" style="background: #28a745;">Upload & Play Media</button>
+            </form>
+            <button onclick="activateLiveCamera()" style="background: #17a2b8;"> Live Camera</button>
+            
+            <hr style="border-color: #333; margin: 20px 0;">
+
+            <h3>AI Processing Actions</h3>
+            <button onclick="takeScreenshot()">Take Screenshot (Save to DB)</button>
+            <button onclick="triggerSR()" style="background: #6f42c1;">Run Image Enhancement</button>
+            <button onclick="triggerDetection()" style="background: #e83e8c;">YOLOv8 Basic  Object Detection</button>
+        </div>
+    </div>
+
+    <div class="ai-results-grid">
+        <div class="card">
+            <h3>Enhancement Window (Before & After)</h3>
+            <div style="display: flex; gap: 10px;">
+                <div style="flex: 1; text-align: center;">
+                    <span style="font-size: 12px; color: #aaa;">Original</span>
+                    <img id="img-original" class="img-preview" src="" style="display: none;">
+                </div>
+                <div style="flex: 1; text-align: center;">
+                    <span style="font-size: 12px; color: #aaa;">Enhanced Image</span>
+                    <img id="img-enhanced" class="img-preview" src="" style="display: none;">
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <h3>Analyzed Objects Window</h3>
+            <div style="text-align: center;">
+                <span style="font-size: 12px; color: #aaa;">YOLOv8 Detections</span>
+                <img id="img-analyzed" class="img-preview" src="" style="display: none;">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Keyboard Listener for 's' key screenshot
+        document.addEventListener('keydown', function(event) {
+            if(event.key === 's' || event.key === 'S') { takeScreenshot(); }
+        });
+
+        function fetchLogs() {
+            fetch('/api/logs').then(r => r.json()).then(data => {
+                const term = document.getElementById('web-terminal');
+                term.innerHTML = data.logs.join('<br>');
+                term.scrollTop = term.scrollHeight; 
+            });
+        }
+        setInterval(fetchLogs, 1500);
+
+        function fetchLatestImages() {
+            fetch('/api/latest_results')
+                .then(r => r.json())
+                .then(data => {
+                    if(data.original) {
+                        document.getElementById('img-original').src = data.original;
+                        document.getElementById('img-original').style.display = 'block';
+                    }
+                    if(data.enhanced) {
+                        document.getElementById('img-enhanced').src = data.enhanced;
+                        document.getElementById('img-enhanced').style.display = 'block';
+                    }
+                    if(data.analyzed) {
+                        document.getElementById('img-analyzed').src = data.analyzed;
+                        document.getElementById('img-analyzed').style.display = 'block';
+                    }
+                });
+        }
+        setInterval(fetchLatestImages, 3000);
+
+        function activateLiveCamera() { fetch('/api/live_camera', {method: 'POST'}); }
+        function takeScreenshot() { fetch('/api/screenshot', {method: 'POST'}); }
+        function triggerSR() { fetch('/api/super_resolution', {method: 'POST'}); }
+        function triggerDetection() { fetch('/api/detect_objects', {method: 'POST'}); }
+    </script>
+</body>
+</html>
