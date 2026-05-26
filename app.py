@@ -1,58 +1,108 @@
-from flask import Flask, render_template, request, redirect, url_for, session, Response, jsonify
-import mysql.connector
-import cv2
-from ultralytics import YOLO
 import os
-import numpy as np
-from werkzeug.utils import secure_filename
-from datetime import datetime
+import cv2
 import time
 import threading
 import glob
+import numpy as np
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, session, Response, jsonify, send_from_directory
+from ultralytics import YOLO
+from werkzeug.utils import secure_filename
+
+# Import ORM models
+from models import db, WebUser, CapturedImage
 
 app = Flask(__name__)
 app.secret_key = "athena_super_secret_key"
 
-# --- CONFIGURATION ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'videos')
-IMAGES_DIR = os.path.join(BASE_DIR, 'static', 'images')
-ENHANCED_DIR = os.path.join(BASE_DIR, 'static', 'enhanced')
-ANALYZED_DIR = os.path.join(BASE_DIR, 'static', 'analyzed')
+# --- CONFIGURATION & ORM SETUP ---
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:password123@localhost/athena_vision'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
 
-for folder in [UPLOAD_FOLDER, IMAGES_DIR, ENHANCED_DIR, ANALYZED_DIR]:
-    os.makedirs(folder, exist_ok=True)
-
+# --- GLOBAL STORAGE PATHS ---
+GLOBAL_STORAGE = '/opt/athena_vision/data'
+UPLOAD_FOLDER = os.path.join(GLOBAL_STORAGE, 'videos')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root', 
-    'password': 'password123',
-    'database': 'athena_vision'
-}
 
 # --- GLOBAL VARIABLES ---
 system_logs = ["[SYSTEM] Athena Vision Command Center initialized."]
 camera = None
 current_frame = None
 last_alert_time = 0
-video_source = 0 
+video_source = None 
 soiling_accumulator = None 
 bg_subtractor = None 
 
 print("Loading YOLOv8 Object Detector...")
 yolo_model = YOLO('yolov8n.pt')
 
-# --- UTILITY FUNCTIONS ---
-def get_db_connection():
-    return mysql.connector.connect(**DB_CONFIG)
+# --- CAMERA STREAMING ENGINE (NETWORK RESILIENT) ---
+class CameraStream:
+    """Dedicated background thread to constantly drain the network stream buffer."""
+    def __init__(self, src=0):
+        # Initialize thread locks and variables first to prevent crashes on failure
+        self.lock = threading.Lock()
+        self.stopped = False
+        self.grabbed = False
+        self.frame = None
 
+        # Force FFMPEG backend for network streams to resolve Linux MJPEG decoding issues
+        if isinstance(src, str) and src.startswith(('http', 'rtsp')):
+            self.stream = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        else:
+            self.stream = cv2.VideoCapture(src)
+            
+        if not hasattr(self, 'stream') or not self.stream.isOpened():
+            add_log(f"CRITICAL ERROR: Failed to open camera stream at {src}. Check hardware/URL.")
+            self.stopped = True
+            return
+
+        # Force a minimal buffer size to prevent network lag accumulation
+        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.grabbed, self.frame = self.stream.read()
+
+    def start(self):
+        if not self.stopped:
+            threading.Thread(target=self.update, daemon=True).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            grabbed, frame = self.stream.read()
+            with self.lock:
+                self.grabbed = grabbed
+                if grabbed:
+                    self.frame = frame
+            # Prevent CPU thrashing if the network drops temporarily
+            if not grabbed:
+                time.sleep(0.1) 
+
+    def read(self):
+        with self.lock:
+            return self.grabbed, self.frame.copy() if self.grabbed else None
+
+    def stop(self):
+        self.stopped = True
+        if hasattr(self, 'stream') and self.stream.isOpened():
+            self.stream.release()
+
+
+
+# --- UTILITY FUNCTIONS ---
 def add_log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
     system_logs.append(f"[{timestamp}] {message}")
     if len(system_logs) > 50:
         system_logs.pop(0)
+
+def get_daily_folder(category):
+    """Creates and returns a DD-MM-YYYY folder path inside the specified category."""
+    date_str = datetime.now().strftime("%d-%m-%Y")
+    folder_path = os.path.join(GLOBAL_STORAGE, category, date_str)
+    os.makedirs(folder_path, exist_ok=True)
+    return folder_path, date_str
 
 # --- FINAL UNIFIED ML/DSP CAMERA HEALTH ENGINE (3-STATE) ---
 def check_camera_health_dsp(frame, accumulator, bg_subtractor):
@@ -88,6 +138,7 @@ def check_camera_health_dsp(frame, accumulator, bg_subtractor):
                 return "obstructed", 99.0, 100.0, accumulator, bg_subtractor
             elif mean_intensity > 200:
                 return "rain/smudge/dust/blur", 95.0, 100.0, accumulator, bg_subtractor
+        
         # B. AI Proximity Obstruction (Masks, Hands, Vehicles blocking lens)
         try:
             small_frame = cv2.resize(frame, (320, 320))
@@ -238,23 +289,41 @@ def generate_frames():
     global current_frame, last_alert_time, video_source, soiling_accumulator, bg_subtractor
     
     local_source = None
-    camera = None
+    camera_stream = None
     is_image = False
     static_img = None
     
+    # Generate a standby frame for when no camera is connected
+    standby_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(standby_frame, "NO SIGNAL - PLEASE CONNECT IP CAMERA", (30, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    
     while True:
+        # STANDBY MODE: If no source is provided, yield the standby frame
+        if video_source is None:
+            current_frame = standby_frame.copy()
+            ret, buffer = cv2.imencode('.jpg', standby_frame)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.5)
+            continue
+
+        # Detect if the source URL has changed
         if local_source != video_source:
             local_source = video_source
-            if camera: camera.release()
+            if camera_stream:
+                camera_stream.stop()
             
+            # Handle static image uploads
             if isinstance(local_source, str) and local_source.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
                 is_image = True
                 static_img = cv2.imread(local_source)
                 add_log("Streaming static image as video feed...")
+            # Handle Network IP Cameras via the resilient thread
             else:
                 is_image = False
-                camera = cv2.VideoCapture(local_source)
+                add_log(f"Initializing connection to: {local_source}")
+                camera_stream = CameraStream(local_source).start()
         
+        # Read frame based on source type
         if is_image:
             if static_img is None: 
                 time.sleep(0.5)
@@ -262,38 +331,30 @@ def generate_frames():
             frame = static_img.copy()
             time.sleep(0.1) 
         else:
-            if camera is None or not camera.isOpened(): 
+            if camera_stream is None:
                 time.sleep(0.5)
                 continue
-            success, frame = camera.read()
+            
+            success, frame = camera_stream.read()
             if not success:
-                if isinstance(local_source, str):
-                    camera.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
+                # If streaming a local video file, loop it back to the beginning
+                if isinstance(local_source, str) and not local_source.startswith(('http', 'rtsp')):
+                    camera_stream.stream.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 time.sleep(0.1)
                 continue
         
         current_frame = frame.copy()
         current_time = time.time()
 
-
-        # Health Monitor (Runs every 2 seconds)
+        # Execute DSP engine every 2 seconds
         if current_time - last_alert_time > 2.0:
-
-            # Unpack all 5 variables returned by the Unified DSP engine
             status, conf, coverage, soiling_accumulator, bg_subtractor = check_camera_health_dsp(frame, soiling_accumulator, bg_subtractor)
+            
+            if coverage >= 75.0: color = "#ff4444" 
+            elif coverage >= 50.0: color = "#ff8800" 
+            elif coverage >= 15.0: color = "#ffcc00" 
+            else: color = "#00ff00" 
 
-            # --- DYNAMIC COLOR CODING ---
-            if coverage >= 75.0:
-                color = "#ff4444" # Red
-            elif coverage >= 50.0:
-                color = "#ff8800" # Orange
-            elif coverage >= 15.0:
-                color = "#ffcc00" # Yellow
-            else:
-                color = "#00ff00" # Green
-
-            # Dashboard Logging with inline HTML colors
             if status == "obstructed":
                 add_log(f'<span style="color: {color};">DSP CRITICAL: Camera View Obstructed! ({conf:.1f}% conf | {coverage:.1f}% coverage)</span>')
             elif status == "rain/smudge/dust/blur":
@@ -303,14 +364,19 @@ def generate_frames():
 
             last_alert_time = current_time
 
-
-
         ret, buffer = cv2.imencode('.jpg', frame)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
+
 # --- WEB ROUTES ---
+@app.route('/media/<category>/<date_folder>/<filename>')
+def serve_media(category, date_folder, filename):
+    """Serves media files from the global storage directory."""
+    directory = os.path.join(GLOBAL_STORAGE, category, date_folder)
+    return send_from_directory(directory, filename)
+
 @app.route('/', methods=['GET', 'POST'])
 def login():
     error = None
@@ -318,15 +384,11 @@ def login():
         username = request.form['username']
         password = request.form['password']
         
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM web_users WHERE username = %s AND password_hash = %s", (username, password))
-        user = cursor.fetchone()
-        conn.close()
+        user = WebUser.query.filter_by(username=username, password_hash=password).first()
         
         if user:
             session['logged_in'] = True
-            session['username'] = user['username']
+            session['username'] = user.username
             add_log(f"User '{username}' logged in.")
             return redirect(url_for('dashboard'))
         else:
@@ -351,21 +413,26 @@ def latest_results():
     if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
     
     response_data = {"original": None, "enhanced": None, "analyzed": None}
+    date_str = datetime.now().strftime("%d-%m-%Y")
     
-    enhanced_files = glob.glob(os.path.join(ENHANCED_DIR, '*_EDSR.jpg'))
-    if enhanced_files:
-        latest_sr = max(enhanced_files, key=os.path.getctime)
-        sr_filename = os.path.basename(latest_sr)
-        orig_filename = sr_filename.replace("_EDSR.jpg", ".jpg")
-        
-        response_data["enhanced"] = f"/static/enhanced/{sr_filename}"
-        if os.path.exists(os.path.join(IMAGES_DIR, orig_filename)):
-            response_data["original"] = f"/static/images/{orig_filename}"
+    # Check Enhanced
+    enhanced_folder = os.path.join(GLOBAL_STORAGE, 'enhanced', date_str)
+    if os.path.exists(enhanced_folder):
+        enhanced_files = glob.glob(os.path.join(enhanced_folder, '*_EDSR.png'))
+        if enhanced_files:
+            latest_sr = max(enhanced_files, key=os.path.getctime)
+            sr_filename = os.path.basename(latest_sr)
+            orig_filename = sr_filename.replace("_EDSR.png", ".png")
+            response_data["enhanced"] = f"/media/enhanced/{date_str}/{sr_filename}"
+            response_data["original"] = f"/media/images/{date_str}/{orig_filename}"
 
-    analyzed_files = glob.glob(os.path.join(ANALYZED_DIR, 'analyzed_*.jpg'))
-    if analyzed_files:
-        latest_analyzed = max(analyzed_files, key=os.path.getctime)
-        response_data["analyzed"] = f"/static/analyzed/{os.path.basename(latest_analyzed)}"
+    # Check Analyzed
+    analyzed_folder = os.path.join(GLOBAL_STORAGE, 'analyzed', date_str)
+    if os.path.exists(analyzed_folder):
+        analyzed_files = glob.glob(os.path.join(analyzed_folder, 'analyzed_*.png'))
+        if analyzed_files:
+            latest_analyzed = max(analyzed_files, key=os.path.getctime)
+            response_data["analyzed"] = f"/media/analyzed/{date_str}/{os.path.basename(latest_analyzed)}"
 
     return jsonify(response_data)
 
@@ -384,14 +451,31 @@ def upload_file():
         bg_subtractor = None
     return redirect(url_for('dashboard'))
 
-@app.route('/api/live_camera', methods=['POST'])
-def live_camera():
+@app.route('/api/ip_camera', methods=['POST'])
+def set_ip_camera():
     global video_source, soiling_accumulator, bg_subtractor
-    add_log("Switching to USB Live Webcam feed...")
-    video_source = 0
+    
+    # Extract the JSON payload from the request
+    data = request.get_json()
+    if not data or 'camera_url' not in data:
+        return jsonify({"error": "No camera URL provided"}), 400
+        
+    camera_url = data['camera_url']
+    
+    # Basic validation to ensure it looks like a network protocol
+    if not camera_url.startswith(('http://', 'https://', 'rtsp://')):
+        camera_url = 'http://' + camera_url
+        
+    add_log(f"Switching to Network Camera stream: {camera_url}")
+    
+    # Update the global source to the new network stream
+    video_source = camera_url
+    
+    # Reset DSP temporal variables for the new feed
     soiling_accumulator = None 
     bg_subtractor = None
-    return jsonify({"status": "success"})
+    
+    return jsonify({"status": "success", "url": camera_url})
 
 # --- AI ACTION PIPELINES ---
 @app.route('/api/screenshot', methods=['POST'])
@@ -399,65 +483,66 @@ def capture_screenshot():
     global current_frame
     if current_frame is None: return jsonify({"error": "No video feed"}), 400
     
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"img_{timestamp}.jpg"
-    filepath = os.path.join(IMAGES_DIR, filename)
+    timestamp = datetime.now().strftime("%H-%M-%S")
+    filename = f"img_{timestamp}.png"
     
+    daily_folder, date_str = get_daily_folder('images')
+    filepath = os.path.join(daily_folder, filename)
+    
+    # Save as PNG
     cv2.imwrite(filepath, current_frame)
     add_log(f"Screenshot saved: {filename}")
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO captured_images (filename, file_path, is_processed, is_analyzed) VALUES (%s, %s, FALSE, FALSE)", (filename, filepath))
-    conn.commit()
-    conn.close()
+    # Save to database via ORM
+    new_image = CapturedImage(
+        filename=filename,
+        file_path=filepath,
+        is_processed=False,
+        is_analyzed=False
+    )
+    db.session.add(new_image)
+    db.session.commit()
     
     return jsonify({"status": "success", "image": filename})
 
 @app.route('/api/super_resolution', methods=['POST'])
 def trigger_sr():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id FROM captured_images WHERE is_processed = FALSE LIMIT 1")
-    row = cursor.fetchone()
-    conn.close()
-    
-    if row:
-        add_log(f"Sent Image ID {row['id']} to dedicated AI Worker for EDSR enhancement...")
+    task = CapturedImage.query.filter_by(is_processed=False).first()
+    if task:
+        add_log(f"Sent Image ID {task.id} to dedicated AI Worker for EDSR enhancement...")
     else:
-        add_log("ℹ️ No new screenshots in queue for the AI Worker.")
+        add_log("No new screenshots in queue for the AI Worker.")
     return jsonify({"status": "queued"})
 
 @app.route('/api/detect_objects', methods=['POST'])
 def trigger_detection():
     def run_det():
-        add_log("Starting YOLOv8 Object Detection...")
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM captured_images WHERE is_analyzed = FALSE LIMIT 1")
-            row = cursor.fetchone()
-            
-            if row:
-                add_log(f"Analyzing Image ID {row['id']}...")
-                img = cv2.imread(row['file_path'])
-                results = yolo_model(img, verbose=False)
-                annotated_img = results[0].plot()
-                
-                new_filename = "analyzed_" + row['filename']
-                new_filepath = os.path.join(ANALYZED_DIR, new_filename)
-                cv2.imwrite(new_filepath, annotated_img)
-                
-                cursor.execute("UPDATE captured_images SET is_analyzed = TRUE WHERE id = %s", (row['id'],))
-                conn.commit()
-                add_log(f"Analyzed image saved as {new_filename}")
-            else:
-                add_log("ℹ️ No unanalyzed images found.")
-            conn.close()
-        except Exception as e:
-            import traceback
-            error_msg = traceback.format_exc().splitlines()[-1]
-            add_log(f"WARNING !!! YOLO Thread Crash: {error_msg}")
+        with app.app_context():
+            add_log("Starting YOLOv8 Object Detection...")
+            try:
+                task = CapturedImage.query.filter_by(is_analyzed=False).first()
+                if task:
+                    add_log(f"Analyzing Image ID {task.id}...")
+                    img = cv2.imread(task.file_path)
+                    results = yolo_model(img, verbose=False)
+                    annotated_img = results[0].plot()
+                    
+                    new_filename = "analyzed_" + task.filename
+                    daily_folder, _ = get_daily_folder('analyzed')
+                    new_filepath = os.path.join(daily_folder, new_filename)
+                    
+                    # Save as PNG
+                    cv2.imwrite(new_filepath, annotated_img)
+                    
+                    task.is_analyzed = True
+                    db.session.commit()
+                    add_log(f"Analyzed image saved as {new_filename}")
+                else:
+                    add_log("No unanalyzed images found.")
+            except Exception as e:
+                import traceback
+                error_msg = traceback.format_exc().splitlines()[-1]
+                add_log(f"WARNING: YOLO Thread Crash: {error_msg}")
     threading.Thread(target=run_det).start()
     return jsonify({"status": "processing"})
 
